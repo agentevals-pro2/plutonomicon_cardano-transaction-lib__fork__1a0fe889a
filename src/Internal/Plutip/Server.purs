@@ -113,6 +113,7 @@ import Effect.Aff.Class (liftAff)
 import Effect.Aff.Retry
   ( RetryPolicy
   , constantDelay
+  , exponentialBackoff
   , limitRetriesByCumulativeDelay
   , recovering
   )
@@ -437,15 +438,23 @@ configCheck cfg =
 -- | Throw an exception if any of the given ports is occupied.
 checkPortsAreFree :: Array { port :: UInt, service :: String } -> Aff Unit
 checkPortsAreFree ports = do
-  occupiedServices <- Array.catMaybes <$> for ports \{ port, service } -> do
-    isPortAvailable port <#> if _ then Nothing else Just (port /\ service)
-  unless (Array.null occupiedServices) do
-    liftEffect $ throw
-      $
-        "Unable to run the following services, because the ports are occupied:\
-        \\n"
-      <> foldMap printServiceEntry occupiedServices
+  result <- try $ recovering portRetryPolicy [ \_ _ -> pure true ] \_ -> do
+    occupied <- getOccupiedServices
+    unless (Array.null occupied) do
+      liftEffect $ throw "retry"
+  case result of
+    Right _ -> pure unit
+    Left _ -> do
+      occupied <- getOccupiedServices
+      unless (Array.null occupied) do
+        liftEffect $ throw
+          $
+            "Unable to run the following services, because the ports are occupied:\n"
+          <> foldMap printServiceEntry occupied
   where
+  getOccupiedServices =
+    Array.catMaybes <$> for ports { port, service } -> do
+      isPortAvailable port <#> if _ then Nothing else Just (port /\ service)
   printServiceEntry :: UInt /\ String -> String
   printServiceEntry (port /\ service) =
     "- " <> service <> " (port: " <> show (UInt.toInt port) <> ")\n"
@@ -733,6 +742,10 @@ makeClusterContractEnv cleanupRef cfg = do
 defaultRetryPolicy :: RetryPolicy
 defaultRetryPolicy = limitRetriesByCumulativeDelay (Milliseconds 3000.00) $
   constantDelay (Milliseconds 100.0)
+
+portRetryPolicy :: RetryPolicy
+portRetryPolicy = limitRetriesByCumulativeDelay (Milliseconds 3000.00) $
+  exponentialBackoff (Milliseconds 100.0)
 
 mkServerEndpointUrl :: PlutipConfig -> String -> String
 mkServerEndpointUrl cfg path = do
